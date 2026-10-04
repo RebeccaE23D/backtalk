@@ -313,6 +313,7 @@ class WarmBrain:
         self._dirty = True             # in flight until its ResultMessage
         await self._client.query(utterance)
         buf = ""
+        spoken_err = False
         async for msg in self._client.receive_response():
             t = type(msg).__name__
             if t == "StreamEvent":
@@ -341,7 +342,26 @@ class WarmBrain:
                     buf = ""
                     if tail:
                         yield tail
+            elif t == "AssistantMessage" and getattr(msg, "error", None):
+                # API-level failure (signed out, usage limit, billing,
+                # bad model id...). The CLI puts the reason in a text block
+                # that never arrives as a StreamEvent, so without this the
+                # turn ends in total silence. Log it and say it out loud.
+                why = " ".join(
+                    getattr(b, "text", "") for b in
+                    (getattr(msg, "content", None) or [])).strip()
+                log(f"[brain] TURN ERROR ({msg.error}): {why[:300]}")
+                spoken_err = True
+                yield ("My brain returned an error: "
+                       + (why or str(msg.error)).split("\n")[0][:200])
             elif t == "ResultMessage":
+                if getattr(msg, "is_error", False) and not spoken_err:
+                    why = str(getattr(msg, "result", "") or
+                              getattr(msg, "subtype", "unknown error"))
+                    log(f"[brain] TURN FAILED ({getattr(msg, 'subtype', '?')}): "
+                        f"{why[:300]}")
+                    yield ("My brain returned an error: "
+                           + why.split("\n")[0][:200])
                 self._dirty = False    # turn fully consumed — pipe aligned
                 self._tally(msg)
                 self._remember_session(msg)
