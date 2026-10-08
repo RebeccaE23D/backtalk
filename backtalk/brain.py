@@ -31,6 +31,7 @@ never the character.
 import asyncio
 import os
 import re
+import time
 import warnings
 from datetime import datetime
 
@@ -46,6 +47,16 @@ from backtalk.config import CFG, DISCIPLINE
 from backtalk.vlog import log
 
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s")
+
+# ask_stream watchdog: receive_response() has no timeout of its own, so a
+# tool call that hangs (slow/stuck image generation, a dead MCP server)
+# leaves the turn in total silence forever — no log line, no error, nothing
+# to interrupt it. STALL_FILLER_S bounds the wait for any single message;
+# on the first stall it speaks a holding line instead of staying mute.
+# HARD_CAP_S bounds the whole turn; past it the turn is presumed dead and
+# killed rather than left to hang indefinitely.
+STALL_FILLER_S = 15.0
+HARD_CAP_S = 150.0
 
 
 SESSION_FILE = os.path.join(CFG["signals_dir"], ".backtalk_session")
@@ -314,7 +325,37 @@ class WarmBrain:
         await self._client.query(utterance)
         buf = ""
         spoken_err = False
-        async for msg in self._client.receive_response():
+        stream = self._client.receive_response().__aiter__()
+        t_start = time.monotonic()
+        warned_stall = False
+        while True:
+            remaining = HARD_CAP_S - (time.monotonic() - t_start)
+            if remaining <= 0:
+                log(f"[brain] turn exceeded hard cap ({HARD_CAP_S:.0f}s) "
+                    "with no result — killing it")
+                try:
+                    await asyncio.wait_for(self._client.interrupt(), 5)
+                except Exception:
+                    pass
+                # _dirty stays True on purpose: the pipe still holds this
+                # dead turn's leftovers, and the existing reset_turn()
+                # (called before the next ask_stream) is what drains them.
+                yield ("That one ran way past normal — I killed it instead "
+                       "of leaving you in dead air. Try again, or skip "
+                       "whatever tool call was stuck.")
+                return
+            try:
+                msg = await asyncio.wait_for(
+                    stream.__anext__(), min(STALL_FILLER_S, remaining))
+            except asyncio.TimeoutError:
+                if not warned_stall:
+                    warned_stall = True
+                    log(f"[brain] no stream activity for "
+                        f"{STALL_FILLER_S:.0f}s — speaking stall filler")
+                    yield "Still working on it, hang tight."
+                continue
+            except StopAsyncIteration:
+                break
             t = type(msg).__name__
             if t == "StreamEvent":
                 ev = getattr(msg, "event", {}) or {}
